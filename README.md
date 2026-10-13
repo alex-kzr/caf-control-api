@@ -1,5 +1,33 @@
-# control-api
+# CAF control API
 
-CAF independent repository scaffold. Intended role: Authenticated projects, tasks, runs, configuration, events and streaming API.
+This independent CAF service accepts one coding task and creates a durable queued run in PostgreSQL. It serves run status, liveness and database readiness. It does **not** execute CLI processes or claim that submitted runs complete without a worker. The umbrella [SPEC](https://github.com/alex-kzr/crew-ai-factory/blob/main/SPEC.md) remains authoritative.
 
-Status: no runtime implementation yet. See the umbrella SPEC.md and docs for requirements. Do not add credentials or generated runtime workspaces.
+## P0 contract
+
+- `GET /health/live`: process liveness, no database check.
+- `GET /health/ready`: verifies access to PostgreSQL and the `runs` table; returns 503 otherwise.
+- `POST /v1/tasks`: bearer protected. Body: `target_repository` (slug), immutable `base_revision` (40 or 64 lowercase hex characters), `prompt`, nonempty `acceptance_criteria`, `provider` (`codex` or `claude`), `max_corrections` (0–3, default 1). Returns task, run, correlation IDs and initial status. An optional `Idempotency-Key` (8–128 ASCII letters/digits/`._-`) returns the same run for the same body; changed content returns 409. Task and run insert in one transaction.
+- `GET /v1/runs/{run_id}`: bearer protected. Returns status, attempt, timestamps and nullable artifact. Unknown IDs return 404.
+
+The API never accepts arbitrary filesystem paths or commands. The worker must resolve `target_repository` against a configured allowlist, verify `base_revision` exists, and create runtime worktrees outside tracked submodules. The [worker handoff](docs/worker-contract.md) records the database claim/lease contract. The worker implementation and recovery behavior are pending; a queued status means only that the database accepted the run. `blocked` worker artifacts map to API status `failed` while retaining the original artifact details.
+
+## Configuration and local run
+
+Python 3.12+ and uv are required. Set `CAF_DATABASE_URL` to a PostgreSQL DSN (`postgresql://...`) and `CAF_API_TOKEN` to a locally generated secret of at least 32 characters. Keep both outside Git and logs. Run `uv sync --locked`, then `uv run --locked python -m caf_control_api.start`. Startup applies the P0 schema and starts Uvicorn on `0.0.0.0:8000`; bind the host publication to `127.0.0.1` in Compose. Direct local development can use `uv run --locked uvicorn caf_control_api.server:app --host 127.0.0.1 --port 8000` after `uv run --locked python -m caf_control_api.migrate`.
+
+Example body:
+
+```json
+{
+  "target_repository": "caf-sample-app",
+  "base_revision": "0123456789abcdef0123456789abcdef01234567",
+  "prompt": "Implement discount code support",
+  "acceptance_criteria": ["The acceptance tests pass"],
+  "provider": "codex",
+  "max_corrections": 1
+}
+```
+
+## Verification and limits
+
+`uv run --locked --python 3.12 --extra test pytest -q` covers authentication, request validation, idempotent responses, status retrieval and readiness behavior with a test store. These tests do **not** prove PostgreSQL integration, migration, Docker startup, worker claims, or run completion. The image is built from this repository's `Dockerfile`; start it through the umbrella's single CAF Compose project when available. The P0 schema is intentionally small (`tasks`, `runs`); other SPEC entities, audit events, streaming, checkpoint recovery, and schema migration versioning remain future work.

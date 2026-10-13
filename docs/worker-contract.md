@@ -1,0 +1,9 @@
+# P0 worker handoff
+
+The API persists `tasks` and `runs` atomically in PostgreSQL. `runs.status='queued'` is the durable wake-up signal; Redis is not required for this first slice. The worker may poll PostgreSQL at a bounded interval. No process is started by the API. This is a proposed worker contract until a worker implements and tests it.
+
+The worker claims one eligible run in a transaction using `FOR UPDATE SKIP LOCKED`, preferring oldest `created_at`. Eligible rows are `queued`, or `running` with `lease_expires_at < now()` after the worker can reconcile/terminate an orphan CLI process. Set `status='running'`, a unique `lease_owner`, `lease_expires_at`, `started_at=COALESCE(started_at, now())`, `updated_at=now()`, and increment `attempt`. A worker must refresh its lease before expiry. A transient database outage must not lead to unbounded duplicate execution.
+
+The worker fetches task fields by `task_id`; it maps `target_repository` through an allowlist, verifies the revision, and passes `run_id`, `correlation_id`, prompt, provider, correction limit and base revision into its workflow. Completion is one conditional transaction: update a run only when `status='running'` and `lease_owner` still matches, store the JSON artifact and terminal status, set `finished_at`/`updated_at`, and clear lease fields. A zero-row update means lost ownership and must not be treated as a successful completion. Map workflow `blocked` to API `failed`; retain its detailed outcome in `artifact`. Bounded attempts and recovery policy are still to be decided and tested.
+
+The P0 table fields are in `src/caf_control_api/schema.sql`; no other tables or queue protocol are implied. Schema rollout currently uses `CREATE TABLE IF NOT EXISTS` at startup. It does not perform upgrades to an existing divergent schema.
