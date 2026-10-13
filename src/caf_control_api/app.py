@@ -12,7 +12,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
 
-from .models import CreateTask, RunStatus, SubmittedRun
+from .models import (
+    CreateTask, RunStatus, SubmittedRun, WorkerClaim, WorkerClaimRequest,
+    WorkerCompleted, WorkerCompletion, WorkerControl, WorkerOwner, WorkerRenewed,
+)
 from .storage import IdempotencyConflict, PostgresStore, Store
 
 
@@ -20,13 +23,24 @@ from .storage import IdempotencyConflict, PostgresStore, Store
 class Settings:
     database_url: str
     api_token: str
+    worker_token: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.worker_token is not None and (
+            len(self.worker_token) < 32 or self.worker_token == self.api_token
+        ):
+            raise ValueError("worker token must be distinct and at least 32 characters")
 
     @classmethod
     def from_env(cls) -> "Settings":
         token = os.environ["CAF_API_TOKEN"]
         if len(token) < 32:
             raise ValueError("CAF_API_TOKEN must contain at least 32 characters")
-        return cls(database_url=os.environ["CAF_DATABASE_URL"], api_token=token)
+        worker_token = os.getenv("CAF_WORKER_TOKEN") or None
+        if worker_token is not None and (len(worker_token) < 32 or worker_token == token):
+            raise ValueError("CAF_WORKER_TOKEN must be distinct and at least 32 characters")
+        return cls(database_url=os.environ["CAF_DATABASE_URL"], api_token=token,
+                   worker_token=worker_token)
 
 
 def create_app(settings: Settings | None = None, store: Store | None = None) -> FastAPI:
@@ -51,6 +65,15 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
             credential.encode("utf-8"), settings.api_token.encode("utf-8")
         ):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+    def authorized_worker(authorization: str | None = Header(default=None)) -> None:
+        if settings.worker_token is None:
+            raise HTTPException(status_code=503, detail="Worker transport disabled")
+        scheme, _, credential = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not compare_digest(
+            credential.encode("utf-8"), settings.worker_token.encode("utf-8")
+        ):
+            raise HTTPException(status_code=401, detail="Invalid worker bearer token")
 
     @app.exception_handler(psycopg.Error)
     async def database_error(_, __):
@@ -92,6 +115,48 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
               dependencies=[Depends(authorized)])
     def cancel_run(run_id: UUID):
         result = store.request_cancel(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return result
+
+    @app.get("/v1/worker/database", response_model=str,
+             dependencies=[Depends(authorized_worker)])
+    def worker_database():
+        return store.database_name()
+
+    @app.post("/v1/worker/quarantine-expired", response_model=list[UUID],
+              dependencies=[Depends(authorized_worker)])
+    def worker_quarantine():
+        return store.quarantine_expired()
+
+    @app.post("/v1/worker/claim", response_model=WorkerClaim | None,
+              dependencies=[Depends(authorized_worker)])
+    def worker_claim(request: WorkerClaimRequest):
+        return store.claim_queued(request.owner, request.lease_seconds)
+
+    @app.post("/v1/worker/runs/{run_id}/control", response_model=WorkerControl,
+              dependencies=[Depends(authorized_worker)])
+    def worker_control(run_id: UUID, request: WorkerOwner):
+        valid, cancelled = store.claim_control(run_id, request.owner)
+        return WorkerControl(valid=valid, cancelled=cancelled)
+
+    @app.post("/v1/worker/runs/{run_id}/renew", response_model=WorkerRenewed,
+              dependencies=[Depends(authorized_worker)])
+    def worker_renew(run_id: UUID, request: WorkerClaimRequest):
+        return WorkerRenewed(renewed=store.renew_lease(run_id, request.owner,
+                                                       request.lease_seconds))
+
+    @app.post("/v1/worker/runs/{run_id}/complete", response_model=WorkerCompleted,
+              dependencies=[Depends(authorized_worker)])
+    def worker_complete(run_id: UUID, request: WorkerCompletion):
+        return WorkerCompleted(completed=store.complete_claim(
+            run_id, request.owner, request.status, request.artifact,
+        ))
+
+    @app.get("/v1/worker/runs/{run_id}", response_model=RunStatus,
+             dependencies=[Depends(authorized_worker)])
+    def worker_get_run(run_id: UUID):
+        result = store.get_run(run_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return result

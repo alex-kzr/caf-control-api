@@ -1,6 +1,7 @@
 """Public P0 request and response contract."""
 
 from datetime import datetime
+import json
 from typing import Literal
 from uuid import UUID
 
@@ -44,3 +45,49 @@ class RunStatus(BaseModel):
     finished_at: datetime | None
     updated_at: datetime
     artifact: dict | None
+
+
+class WorkerOwner(BaseModel):
+    owner: str = Field(pattern=r"^[A-Za-z0-9._-]{8,128}$")
+
+
+class WorkerClaimRequest(WorkerOwner):
+    lease_seconds: int = Field(default=60, ge=15, le=3600)
+
+
+class WorkerClaim(BaseModel):
+    id: UUID
+    task_id: UUID
+    correlation_id: UUID
+    target_repository: str
+    base_revision: str
+    prompt: str
+    acceptance_criteria: list[str]
+    provider: Literal["codex", "claude"]
+    max_corrections: int
+    attempt: int
+
+
+class WorkerControl(BaseModel):
+    valid: bool
+    cancelled: bool
+
+
+class WorkerRenewed(BaseModel):
+    renewed: bool
+
+
+class WorkerCompleted(BaseModel):
+    completed: bool
+
+
+class WorkerCompletion(WorkerOwner):
+    status: Literal["succeeded", "failed", "cancelled"]
+    artifact: dict
+
+    @field_validator("artifact")
+    @classmethod
+    def bounded_artifact(cls, artifact: dict) -> dict:
+        if len(json.dumps(artifact).encode("utf-8")) > 131_072:
+            raise ValueError("artifact exceeds 128 KiB")
+        return artifact

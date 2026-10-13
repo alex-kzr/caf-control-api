@@ -6,11 +6,13 @@ from psycopg_pool import PoolTimeout
 
 from caf_control_api.app import Settings, create_app
 from caf_control_api.models import RunStatus, SubmittedRun
-from caf_control_api.storage import IdempotencyConflict
+from caf_control_api.storage import ClaimedRun, IdempotencyConflict
 
 
 TOKEN = "x" * 32
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+WORKER_TOKEN = "w" * 32
+WORKER_AUTH = {"Authorization": f"Bearer {WORKER_TOKEN}"}
 BODY = {
     "target_repository": "caf-sample-app",
     "base_revision": "a" * 40,
@@ -25,6 +27,8 @@ class FakeStore:
         self.available = True
         self.submissions = {}
         self.cancelled = set()
+        self.worker_owner = None
+        self.worker_completed = None
 
     def ready(self):
         return self.available
@@ -59,10 +63,38 @@ class FakeStore:
             self.cancelled.add(run_id)
         return self.get_run(run_id)
 
+    def database_name(self):
+        return "caf_queue_test_unit"
 
-def client():
+    def quarantine_expired(self):
+        return []
+
+    def claim_queued(self, owner, lease_seconds=60):
+        if self.worker_owner is not None or not self.submissions:
+            return None
+        self.worker_owner = owner
+        _, run = next(iter(self.submissions.values()))
+        return ClaimedRun(run.run_id, run.task_id, run.correlation_id,
+                          "caf-sample-app", "a" * 40, "Fixture", ["Pass"],
+                          "codex", 1, 1)
+
+    def claim_control(self, run_id, owner):
+        return self.worker_owner == owner, run_id in self.cancelled
+
+    def renew_lease(self, run_id, owner, lease_seconds=60):
+        return self.worker_owner == owner
+
+    def complete_claim(self, run_id, owner, status, artifact):
+        if self.worker_owner != owner:
+            return False
+        self.worker_completed = (run_id, status, artifact)
+        return True
+
+
+def client(worker_token=None):
     store = FakeStore()
-    app = create_app(Settings(database_url="unused", api_token=TOKEN), store)
+    app = create_app(Settings(database_url="unused", api_token=TOKEN,
+                              worker_token=worker_token), store)
     return TestClient(app), store
 
 
@@ -133,3 +165,35 @@ def test_cancel_requires_auth_and_is_idempotent():
     assert first.status_code == second.status_code == 200
     assert first.json()["status"] == second.json()["status"] == "cancelled"
     assert first.json()["cancel_requested"] is True
+
+
+def test_worker_transport_reuses_auth_and_guards_owner_and_artifact():
+    disabled, _ = client()
+    assert disabled.get("/v1/worker/database", headers=WORKER_AUTH).status_code == 503
+    http, store = client(WORKER_TOKEN)
+    run_id = http.post("/v1/tasks", json=BODY, headers=AUTH).json()["run_id"]
+    owner = "worker-12345"
+    assert http.post("/v1/worker/claim", json={"owner": owner}).status_code == 401
+    assert http.get("/v1/worker/database", headers=AUTH).status_code == 401
+    assert http.post("/v1/tasks", json=BODY, headers=WORKER_AUTH).status_code == 401
+    assert http.get("/v1/worker/database", headers=WORKER_AUTH).json() == "caf_queue_test_unit"
+    assert http.post("/v1/worker/claim", json={"owner": "bad"}, headers=WORKER_AUTH).status_code == 422
+    claimed = http.post("/v1/worker/claim", json={"owner": owner}, headers=WORKER_AUTH)
+    assert claimed.status_code == 200 and claimed.json()["id"] == run_id
+    assert http.post("/v1/worker/claim", json={"owner": owner}, headers=WORKER_AUTH).json() is None
+    assert http.post(f"/v1/worker/runs/{run_id}/control",
+                     json={"owner": "other-worker"}, headers=WORKER_AUTH).json() == {
+                         "valid": False, "cancelled": False}
+    assert http.post(f"/v1/worker/runs/{run_id}/renew",
+                     json={"owner": owner, "lease_seconds": 60}, headers=WORKER_AUTH).json() == {
+                         "renewed": True}
+    assert http.post(f"/v1/worker/runs/{run_id}/complete",
+                     json={"owner": owner, "status": "succeeded",
+                           "artifact": {"large": "x" * 140_000}}, headers=WORKER_AUTH).status_code == 422
+    completed = http.post(f"/v1/worker/runs/{run_id}/complete",
+                          json={"owner": owner, "status": "succeeded",
+                                "artifact": {"kind": "synthetic"}}, headers=WORKER_AUTH)
+    assert completed.json() == {"completed": True}
+    assert store.worker_completed[1:] == ("succeeded", {"kind": "synthetic"})
+    assert http.get(f"/v1/worker/runs/{run_id}", headers=WORKER_AUTH).status_code == 200
+    assert http.post("/v1/worker/quarantine-expired", headers=WORKER_AUTH).json() == []
