@@ -4,6 +4,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from hmac import compare_digest
 from uuid import UUID
 
@@ -17,30 +18,50 @@ from .models import (
     WorkerCompleted, WorkerCompletion, WorkerControl, WorkerOwner, WorkerRenewed,
 )
 from .storage import IdempotencyConflict, PostgresStore, Store
+from .worker_grant import WorkerGrant
 
 
 @dataclass(frozen=True)
 class Settings:
     database_url: str
     api_token: str
-    worker_token: str | None = None
+    worker_grant: WorkerGrant | None = None
 
     def __post_init__(self) -> None:
-        if self.worker_token is not None and (
-            len(self.worker_token) < 32 or self.worker_token == self.api_token
-        ):
-            raise ValueError("worker token must be distinct and at least 32 characters")
+        if self.worker_grant is not None and self.worker_grant.token == self.api_token:
+            raise ValueError("worker token must be distinct from API token")
 
     @classmethod
     def from_env(cls) -> "Settings":
         token = os.environ["CAF_API_TOKEN"]
         if len(token) < 32:
             raise ValueError("CAF_API_TOKEN must contain at least 32 characters")
-        worker_token = os.getenv("CAF_WORKER_TOKEN") or None
-        if worker_token is not None and (len(worker_token) < 32 or worker_token == token):
-            raise ValueError("CAF_WORKER_TOKEN must be distinct and at least 32 characters")
+        worker_fields = ("CAF_WORKER_TOKEN", "CAF_WORKER_ID", "CAF_WORKER_DATABASE",
+                         "CAF_WORKER_RUN_ID", "CAF_WORKER_TASK_ID", "CAF_WORKER_REPOSITORY",
+                         "CAF_WORKER_WORKSPACE_ID",
+                         "CAF_WORKER_BASE_REVISION", "CAF_WORKER_PROVIDER",
+                         "CAF_WORKER_EXPIRES_AT")
+        supplied = {key: os.getenv(key) for key in worker_fields}
+        if any(supplied.values()) and not all(supplied.values()):
+            raise ValueError("worker grant requires every scope and expiry field")
+        grant = None
+        if all(supplied.values()):
+            try:
+                grant = WorkerGrant(
+                    token=supplied["CAF_WORKER_TOKEN"], identity=supplied["CAF_WORKER_ID"],
+                    database=supplied["CAF_WORKER_DATABASE"],
+                    run_id=UUID(supplied["CAF_WORKER_RUN_ID"]),
+                    task_id=UUID(supplied["CAF_WORKER_TASK_ID"]),
+                    repository=supplied["CAF_WORKER_REPOSITORY"],
+                    workspace_id=supplied["CAF_WORKER_WORKSPACE_ID"],
+                    base_revision=supplied["CAF_WORKER_BASE_REVISION"],
+                    provider=supplied["CAF_WORKER_PROVIDER"],
+                    expires_at=datetime.fromisoformat(supplied["CAF_WORKER_EXPIRES_AT"]),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid worker grant configuration") from exc
         return cls(database_url=os.environ["CAF_DATABASE_URL"], api_token=token,
-                   worker_token=worker_token)
+                   worker_grant=grant)
 
 
 def create_app(settings: Settings | None = None, store: Store | None = None) -> FastAPI:
@@ -67,13 +88,30 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     def authorized_worker(authorization: str | None = Header(default=None)) -> None:
-        if settings.worker_token is None:
+        grant = settings.worker_grant
+        if grant is None or not grant.active():
             raise HTTPException(status_code=503, detail="Worker transport disabled")
         scheme, _, credential = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not compare_digest(
-            credential.encode("utf-8"), settings.worker_token.encode("utf-8")
+            credential.encode("utf-8"), grant.token.encode("utf-8")
         ):
             raise HTTPException(status_code=401, detail="Invalid worker bearer token")
+        if store.database_name() != grant.database:
+            raise HTTPException(status_code=503, detail="Worker database scope unavailable")
+
+    def worker_identity(owner: str) -> WorkerGrant:
+        grant = settings.worker_grant
+        assert grant is not None
+        if owner != grant.identity:
+            raise HTTPException(status_code=403, detail="Worker identity mismatch")
+        return grant
+
+    def scoped_run(run_id: UUID) -> WorkerGrant:
+        grant = settings.worker_grant
+        assert grant is not None
+        if run_id != grant.run_id or not store.run_in_scope(grant):
+            raise HTTPException(status_code=404, detail="Run not found")
+        return grant
 
     @app.exception_handler(psycopg.Error)
     async def database_error(_, __):
@@ -122,33 +160,40 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     @app.get("/v1/worker/database", response_model=str,
              dependencies=[Depends(authorized_worker)])
     def worker_database():
-        return store.database_name()
+        return settings.worker_grant.database
 
     @app.post("/v1/worker/quarantine-expired", response_model=list[UUID],
               dependencies=[Depends(authorized_worker)])
     def worker_quarantine():
-        return store.quarantine_expired()
+        return store.quarantine_expired_scoped(settings.worker_grant)
 
     @app.post("/v1/worker/claim", response_model=WorkerClaim | None,
               dependencies=[Depends(authorized_worker)])
     def worker_claim(request: WorkerClaimRequest):
-        return store.claim_queued(request.owner, request.lease_seconds)
+        grant = worker_identity(request.owner)
+        return store.claim_scoped(grant, request.lease_seconds)
 
     @app.post("/v1/worker/runs/{run_id}/control", response_model=WorkerControl,
               dependencies=[Depends(authorized_worker)])
     def worker_control(run_id: UUID, request: WorkerOwner):
+        worker_identity(request.owner)
+        scoped_run(run_id)
         valid, cancelled = store.claim_control(run_id, request.owner)
         return WorkerControl(valid=valid, cancelled=cancelled)
 
     @app.post("/v1/worker/runs/{run_id}/renew", response_model=WorkerRenewed,
               dependencies=[Depends(authorized_worker)])
     def worker_renew(run_id: UUID, request: WorkerClaimRequest):
+        worker_identity(request.owner)
+        scoped_run(run_id)
         return WorkerRenewed(renewed=store.renew_lease(run_id, request.owner,
                                                        request.lease_seconds))
 
     @app.post("/v1/worker/runs/{run_id}/complete", response_model=WorkerCompleted,
               dependencies=[Depends(authorized_worker)])
     def worker_complete(run_id: UUID, request: WorkerCompletion):
+        worker_identity(request.owner)
+        scoped_run(run_id)
         return WorkerCompleted(completed=store.complete_claim(
             run_id, request.owner, request.status, request.artifact,
         ))
@@ -156,6 +201,7 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     @app.get("/v1/worker/runs/{run_id}", response_model=RunStatus,
              dependencies=[Depends(authorized_worker)])
     def worker_get_run(run_id: UUID):
+        scoped_run(run_id)
         result = store.get_run(run_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Run not found")

@@ -21,6 +21,7 @@ Example body:
 ```json
 {
   "target_repository": "caf-sample-app",
+  "workspace_id": "caf-sample-fixture-v1",
   "base_revision": "0123456789abcdef0123456789abcdef01234567",
   "prompt": "Implement discount code support",
   "acceptance_criteria": ["The acceptance tests pass"],
@@ -33,12 +34,22 @@ Example body:
 
 `uv run --locked --python 3.12 --extra test pytest -q` covers authentication, request validation, idempotent responses, cancellation, status retrieval and readiness behavior with a test store. The opt-in `tests/test_queue_live.py` runs only against a dedicated `caf_queue_test_*` database and verifies concurrent claim, lease, cancellation, expired-Run quarantine and the transactionally written `run_journal`. The journal records claim, terminal completion and quarantine with attempt and owner; the Run row holds the durable lease. It is a small lifecycle journal, not the full event/checkpoint/audit model in SPEC. The umbrella's API/PostgreSQL Compose slice has also passed live readiness, authenticated intake and normal group stop/start. These checks do **not** prove a production worker process, CLI process-tree cleanup, resume or complete SPEC core. Other SPEC entities, streaming, checkpoint recovery, and schema migration versioning remain future work.
 
-The `/v1/worker/*` routes expose only database identity, one queued claim,
-lease/cancel status, renewal, conditional completion, expired-lease quarantine
-and Run readback. They require a distinct `CAF_WORKER_TOKEN` of at least 32
-characters; with no token configured, every worker route returns 503. The
-existing `CAF_API_TOKEN` cannot call worker routes and a worker token cannot
-submit tasks. PostgreSQL still guards ownership. There is no command-execution
-endpoint and no CLI authentication material in this service. Completion
-artifacts are limited to 128 KiB. Route tests use a dummy token and fake store;
-no live worker credential has been created or granted.
+The `/v1/worker/*` routes expose database identity, claim, lease/cancel status,
+renewal, conditional completion, expired-lease quarantine and Run readback.
+They are disabled unless **all** grant settings are present: distinct
+`CAF_WORKER_TOKEN` (at least 32 characters), `CAF_WORKER_ID`,
+`CAF_WORKER_DATABASE`, `CAF_WORKER_RUN_ID`, `CAF_WORKER_TASK_ID`,
+`CAF_WORKER_REPOSITORY`, `CAF_WORKER_WORKSPACE_ID`,
+`CAF_WORKER_BASE_REVISION`, `CAF_WORKER_PROVIDER`, and
+`CAF_WORKER_EXPIRES_AT` (timezone-aware ISO timestamp, at most one hour ahead).
+The database must be an exact `caf_queue_test_*` name. Each request checks its
+actual connected database and the grant's expiry. Only the exact matching
+Run/task/repository/workspace ID/base/provider may be claimed or read; the
+lease owner must equal the grant identity. No unknown workspace or incomplete
+grant expands access. `workspace_id` is a task contract label; the host worker
+must separately map it to an allowed path, since the API cannot inspect host
+files. The worker token cannot submit tasks, and `CAF_API_TOKEN` cannot use
+worker routes. Completion artifacts are capped at 128 KiB. This service never
+starts a CLI. Revocation requires unsetting or replacing the grant and
+restarting the API; an expired grant fails closed. Tests use dummy tokens; no
+live worker credential has been created or granted.

@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS tasks (
     id uuid PRIMARY KEY,
     target_repository text NOT NULL,
+    workspace_id text,
     base_revision text NOT NULL,
     prompt text NOT NULL,
     acceptance_criteria jsonb NOT NULL,
@@ -32,6 +33,7 @@ CREATE INDEX IF NOT EXISTS runs_claim_idx ON runs (created_at)
 WHERE status = 'queued';
 
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workspace_id text;
 
 CREATE TABLE IF NOT EXISTS run_journal (
     seq bigserial PRIMARY KEY,

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 class CreateTask(BaseModel):
     target_repository: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")
+    workspace_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")
     base_revision: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     prompt: str = Field(min_length=1, max_length=20_000)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=20)
@@ -60,6 +61,7 @@ class WorkerClaim(BaseModel):
     task_id: UUID
     correlation_id: UUID
     target_repository: str
+    workspace_id: str | None
     base_revision: str
     prompt: str
     acceptance_criteria: list[str]
