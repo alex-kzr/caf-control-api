@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import re
+from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -14,6 +16,20 @@ from .models import CreateTask, RunStatus, SubmittedRun
 
 class IdempotencyConflict(Exception):
     """The same key was reused with different task content."""
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedRun:
+    id: UUID
+    task_id: UUID
+    correlation_id: UUID
+    target_repository: str
+    base_revision: str
+    prompt: str
+    acceptance_criteria: list[str]
+    provider: str
+    max_corrections: int
+    attempt: int
 
 
 class Store(Protocol):
@@ -89,3 +105,64 @@ class PostgresStore:
                 )
                 row = cur.fetchone()
         return RunStatus(**row) if row else None
+
+    @staticmethod
+    def _lease_args(owner: str, lease_seconds: int) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", owner):
+            raise ValueError("owner must be a stable 8-128 character identifier")
+        if not isinstance(lease_seconds, int) or not 15 <= lease_seconds <= 3600:
+            raise ValueError("lease_seconds must be an integer from 15 to 3600")
+
+    def claim_queued(self, owner: str, lease_seconds: int = 60) -> ClaimedRun | None:
+        """Claim one queued run; expired running leases are not reclaimed yet."""
+        self._lease_args(owner, lease_seconds)
+        with self.pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """WITH candidate AS (
+                           SELECT id FROM runs WHERE status = 'queued'
+                           ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1
+                       )
+                       UPDATE runs AS r
+                       SET status = 'running', lease_owner = %s,
+                           lease_expires_at = now() + (%s * interval '1 second'),
+                           started_at = COALESCE(started_at, now()),
+                           updated_at = now(), attempt = attempt + 1
+                       FROM candidate c, tasks t
+                       WHERE r.id = c.id AND t.id = r.task_id
+                       RETURNING r.id, r.task_id, r.correlation_id,
+                                 t.target_repository, t.base_revision, t.prompt,
+                                 t.acceptance_criteria, r.provider,
+                                 r.max_corrections, r.attempt""",
+                    (owner, lease_seconds),
+                )
+                row = cur.fetchone()
+        return ClaimedRun(**row) if row else None
+
+    def renew_lease(self, run_id: UUID, owner: str, lease_seconds: int = 60) -> bool:
+        self._lease_args(owner, lease_seconds)
+        with self.pool.connection() as conn, conn.transaction():
+            result = conn.execute(
+                """UPDATE runs SET lease_expires_at = now() + (%s * interval '1 second'),
+                          updated_at = now()
+                   WHERE id = %s AND status = 'running' AND lease_owner = %s
+                     AND lease_expires_at > now()""",
+                (lease_seconds, run_id, owner),
+            )
+            return result.rowcount == 1
+
+    def complete_claim(self, run_id: UUID, owner: str, status: str, artifact: dict) -> bool:
+        if status not in {"succeeded", "failed", "cancelled"}:
+            raise ValueError("status must be terminal")
+        self._lease_args(owner, 60)
+        json.dumps(artifact)
+        with self.pool.connection() as conn, conn.transaction():
+            result = conn.execute(
+                """UPDATE runs SET status = %s, artifact = %s,
+                          finished_at = now(), updated_at = now(),
+                          lease_owner = NULL, lease_expires_at = NULL
+                   WHERE id = %s AND status = 'running' AND lease_owner = %s
+                     AND lease_expires_at > now()""",
+                (status, Jsonb(artifact), run_id, owner),
+            )
+            return result.rowcount == 1
