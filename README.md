@@ -8,6 +8,8 @@ This independent CAF service accepts one coding task and creates a durable queue
 - `GET /health/ready`: verifies access to PostgreSQL and the `runs` table; returns 503 otherwise.
 - `POST /v1/tasks`: bearer protected. Body: `target_repository` (slug), immutable `base_revision` (40 or 64 lowercase hex characters), `prompt`, nonempty `acceptance_criteria`, `provider` (`codex` or `claude`), `max_corrections` (0–3, default 1). Returns task, run, correlation IDs and initial status. An optional `Idempotency-Key` (8–128 ASCII letters/digits/`._-`) returns the same run for the same body; changed content returns 409. Task and run insert in one transaction.
 - `GET /v1/runs/{run_id}`: bearer protected. Returns status, attempt, timestamps and nullable artifact. Unknown IDs return 404.
+- `GET /v1/runs/{run_id}/results`: bearer protected typed projection of known artifact fields. Raw diff/transcript keys are omitted, but known text is not secret-redacted.
+- `GET /v1/runs/{run_id}/events?after_seq=0&limit=100`: bearer protected bounded lease journal (`claimed`, `completed`, `quarantined`), ascending sequence, exclusive cursor; not a full workflow stream.
 - `POST /v1/runs/{run_id}/cancel`: bearer protected and idempotent. A queued Run becomes `cancelled` immediately; a running Run gets `cancel_requested=true` for its owner to observe and terminate. A terminal Run is returned unchanged. The API does not kill a process.
 
 The API never accepts arbitrary filesystem paths or commands. The worker must resolve `target_repository` against a configured allowlist, verify `base_revision` exists, and create runtime worktrees outside tracked submodules. The [worker handoff](docs/worker-contract.md) records the implemented queued-run claim, lease renewal, cancellation signal and guarded completion contract. Expired leases can be quarantined as `failed/orphan_unverified` without automatic retry. This does not prove the child process stopped. Production worker execution remains pending; a queued status means only that the database accepted the run. `blocked` worker artifacts map to API status `failed` while retaining the original artifact details.
@@ -31,6 +33,9 @@ Example body:
 ```
 
 ## Verification and limits
+
+The new results/events endpoints have authenticated test-store coverage;
+their SQL-backed HTTP path has not yet been live verified.
 
 `uv run --locked --python 3.12 --extra test pytest -q` covers authentication, request validation, idempotent responses, cancellation, status retrieval and readiness behavior with a test store. The opt-in `tests/test_queue_live.py` runs only against a dedicated `caf_queue_test_*` database and verifies concurrent claim, lease, cancellation, expired-Run quarantine and the transactionally written `run_journal`. The journal records claim, terminal completion and quarantine with attempt and owner; the Run row holds the durable lease. It is a small lifecycle journal, not the full event/checkpoint/audit model in SPEC. The umbrella's API/PostgreSQL Compose slice has also passed live readiness, authenticated intake and normal group stop/start. These checks do **not** prove a production worker process, CLI process-tree cleanup, resume or complete SPEC core. Other SPEC entities, streaming, checkpoint recovery, and schema migration versioning remain future work.
 

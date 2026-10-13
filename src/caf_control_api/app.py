@@ -9,13 +9,14 @@ from hmac import compare_digest
 from uuid import UUID
 
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
 
 from .models import (
-    CreateTask, RunStatus, SubmittedRun, WorkerClaim, WorkerClaimRequest,
+    CreateTask, RunEvent, RunResults, RunStatus, SubmittedRun, WorkerClaim, WorkerClaimRequest,
     WorkerCompleted, WorkerCompletion, WorkerControl, WorkerOwner, WorkerRenewed,
+    project_results,
 )
 from .storage import IdempotencyConflict, PostgresStore, Store
 from .worker_grant import WorkerGrant
@@ -148,6 +149,22 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
         if result is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return result
+
+    @app.get("/v1/runs/{run_id}/events", response_model=list[RunEvent],
+             dependencies=[Depends(authorized)])
+    def get_run_events(run_id: UUID, after_seq: int = Query(default=0, ge=0),
+                       limit: int = Query(default=100, ge=1, le=100)):
+        if store.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return store.get_run_events(run_id, after_seq, limit)
+
+    @app.get("/v1/runs/{run_id}/results", response_model=RunResults,
+             dependencies=[Depends(authorized)])
+    def get_run_results(run_id: UUID):
+        result = store.get_run(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return project_results(result)
 
     @app.post("/v1/runs/{run_id}/cancel", response_model=RunStatus,
               dependencies=[Depends(authorized)])

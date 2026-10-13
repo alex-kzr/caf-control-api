@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from .models import CreateTask, RunStatus, SubmittedRun
+from .models import CreateTask, RunEvent, RunStatus, SubmittedRun
 from .worker_grant import WorkerGrant
 
 
@@ -38,6 +38,7 @@ class Store(Protocol):
     def ready(self) -> bool: ...
     def submit(self, task: CreateTask, key: str | None) -> SubmittedRun: ...
     def get_run(self, run_id: UUID) -> RunStatus | None: ...
+    def get_run_events(self, run_id: UUID, after_seq: int = 0, limit: int = 100) -> list[RunEvent]: ...
     def request_cancel(self, run_id: UUID) -> RunStatus | None: ...
     def database_name(self) -> str: ...
     def quarantine_expired(self) -> list[UUID]: ...
@@ -122,6 +123,18 @@ class PostgresStore:
                 )
                 row = cur.fetchone()
         return RunStatus(**row) if row else None
+
+    def get_run_events(self, run_id: UUID, after_seq: int = 0, limit: int = 100) -> list[RunEvent]:
+        with self.pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """SELECT seq, attempt, event, owner, terminal_status, created_at
+                       FROM run_journal WHERE run_id = %s AND seq > %s
+                       ORDER BY seq LIMIT %s""",
+                    (run_id, after_seq, limit),
+                )
+                rows = cur.fetchall()
+        return [RunEvent(**row) for row in rows]
 
     def request_cancel(self, run_id: UUID) -> RunStatus | None:
         """Cancel queued work immediately, or signal its current worker."""

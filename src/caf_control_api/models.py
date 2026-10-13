@@ -48,6 +48,74 @@ class RunStatus(BaseModel):
     artifact: dict | None
 
 
+class RunEvent(BaseModel):
+    """One persisted P0 run_journal transition, not a full event stream."""
+
+    seq: int
+    attempt: int
+    event: Literal["claimed", "completed", "quarantined"]
+    owner: str | None
+    terminal_status: str | None
+    created_at: datetime
+
+
+class QualityGateSummary(BaseModel):
+    suite: str
+    passed: bool
+    exit_code: int | None = None
+
+
+class ReviewSummary(BaseModel):
+    approved: bool
+    findings: list[str]
+
+
+class RunResults(BaseModel):
+    """Typed allowlist of current artifact fields; strings are not secret-redacted."""
+
+    run_id: UUID
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+    artifact_present: bool
+    execution_kind: str | None = None
+    reason: str | None = None
+    quarantined: bool
+    gates: list[QualityGateSummary] | None = None
+    review: ReviewSummary | None = None
+    commit: str | None = None
+
+
+def project_results(run: RunStatus) -> RunResults:
+    artifact = run.artifact or {}
+    raw_gates = artifact.get("gates")
+    gates = None
+    if isinstance(raw_gates, list):
+        valid_gates = []
+        for item in raw_gates:
+            if not isinstance(item, dict) or not isinstance(item.get("suite"), str) or not isinstance(item.get("passed"), bool):
+                continue
+            exit_code = item.get("exit_code")
+            valid_gates.append(QualityGateSummary(
+                suite=item["suite"], passed=item["passed"],
+                exit_code=exit_code if type(exit_code) is int else None,
+            ))
+        gates = valid_gates
+    raw_review = artifact.get("review")
+    review = None
+    if (isinstance(raw_review, dict) and isinstance(raw_review.get("approved"), bool)
+            and isinstance(raw_review.get("findings"), list)
+            and all(isinstance(item, str) for item in raw_review["findings"])):
+        review = ReviewSummary(approved=raw_review["approved"], findings=raw_review["findings"])
+    reason = artifact.get("reason")
+    return RunResults(
+        run_id=run.id, status=run.status, artifact_present=run.artifact is not None,
+        execution_kind=artifact.get("execution_kind") if isinstance(artifact.get("execution_kind"), str) else None,
+        reason=reason if isinstance(reason, str) else None,
+        quarantined=run.status == "failed" and reason == "orphan_unverified",
+        gates=gates, review=review,
+        commit=artifact.get("commit") if isinstance(artifact.get("commit"), str) else None,
+    )
+
+
 class WorkerOwner(BaseModel):
     owner: str = Field(pattern=r"^[A-Za-z0-9._-]{8,128}$")
 

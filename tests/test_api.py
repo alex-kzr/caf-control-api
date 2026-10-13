@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from psycopg_pool import PoolTimeout
 
 from caf_control_api.app import Settings, create_app
-from caf_control_api.models import RunStatus, SubmittedRun
+from caf_control_api.models import RunEvent, RunStatus, SubmittedRun
 from caf_control_api.storage import ClaimedRun, IdempotencyConflict
 from caf_control_api.worker_grant import WorkerGrant
 from caf_control_api.models import CreateTask
@@ -34,6 +34,8 @@ class FakeStore:
         self.cancelled = set()
         self.worker_owner = None
         self.worker_completed = None
+        self.artifact = None
+        self.events = []
 
     def ready(self):
         return self.available
@@ -59,8 +61,11 @@ class FakeStore:
                                  status="cancelled" if run_id in self.cancelled else "queued",
                                  cancel_requested=run_id in self.cancelled, attempt=0,
                                  created_at=now, started_at=None, finished_at=None,
-                                 updated_at=now, artifact=None)
+                                 updated_at=now, artifact=self.artifact)
         return None
+
+    def get_run_events(self, run_id, after_seq=0, limit=100):
+        return [event for event in self.events if event.seq > after_seq][:limit]
 
     def request_cancel(self, run_id):
         status = self.get_run(run_id)
@@ -163,6 +168,36 @@ def test_submit_replay_status_and_conflict():
     assert http.get(f"/v1/runs/{uuid4()}", headers=AUTH).status_code == 404
     changed = {**BODY, "prompt": "Different"}
     assert http.post("/v1/tasks", json=changed, headers=headers).status_code == 409
+
+
+def test_typed_run_events_and_results_are_authenticated_and_bounded():
+    http, store = client()
+    run_id = http.post("/v1/tasks", json=BODY, headers=AUTH).json()["run_id"]
+    now = datetime.now(timezone.utc)
+    store.events = [RunEvent(seq=1, attempt=1, event="claimed", owner="worker-test-01",
+                             terminal_status=None, created_at=now),
+                    RunEvent(seq=2, attempt=1, event="quarantined", owner=None,
+                             terminal_status="failed", created_at=now)]
+    store.artifact = {
+        "execution_kind": "p0-queued-code-fixture", "reason": "quality_gate_failed",
+        "gates": [{"suite": "test_discount.py", "passed": False, "exit_code": 1},
+                  {"suite": 12, "passed": "yes"}],
+        "review": {"approved": False, "findings": ["Discount absent"]},
+        "commit": "a" * 40, "diff": "private source patch", "review_text": "raw response",
+    }
+    events_url = f"/v1/runs/{run_id}/events"
+    results_url = f"/v1/runs/{run_id}/results"
+    assert http.get(events_url).status_code == 401
+    assert http.get(results_url).status_code == 401
+    assert http.get(f"{events_url}?after_seq=1&limit=1", headers=AUTH).json()[0]["event"] == "quarantined"
+    assert http.get(f"{events_url}?limit=101", headers=AUTH).status_code == 422
+    assert http.get(events_url, headers=AUTH).json()[0]["seq"] == 1
+    result = http.get(results_url, headers=AUTH).json()
+    assert result["gates"] == [{"suite": "test_discount.py", "passed": False, "exit_code": 1}]
+    assert result["review"] == {"approved": False, "findings": ["Discount absent"]}
+    assert "diff" not in result and "review_text" not in result
+    assert http.get(f"/v1/runs/{uuid4()}/events", headers=AUTH).status_code == 404
+    assert http.get(f"/v1/runs/{uuid4()}/results", headers=AUTH).status_code == 404
 
 
 def test_rejects_invalid_idempotency_key_and_empty_criterion():
