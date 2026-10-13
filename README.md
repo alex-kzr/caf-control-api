@@ -51,5 +51,6 @@ must separately map it to an allowed path, since the API cannot inspect host
 files. The worker token cannot submit tasks, and `CAF_API_TOKEN` cannot use
 worker routes. Completion artifacts are capped at 128 KiB. This service never
 starts a CLI. Revocation requires unsetting or replacing the grant and
-restarting the API; an expired grant fails closed. Tests use dummy tokens; no
-live worker credential has been created or granted.
+restarting the API; an expired grant fails closed. Unit and database tests use
+dummy tokens. One explicitly approved temporary token was subsequently used
+for an isolated synthetic HTTP Run and then removed; core has no grant.
