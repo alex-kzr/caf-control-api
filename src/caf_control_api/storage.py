@@ -56,6 +56,11 @@ class PostgresStore:
         except Exception:
             return False
 
+    def database_name(self) -> str:
+        """Return the actual connected database for test-only safety guards."""
+        with self.pool.connection() as conn:
+            return conn.execute("SELECT current_database()").fetchone()[0]
+
     def submit(self, task: CreateTask, key: str | None) -> SubmittedRun:
         payload = task.model_dump(mode="json")
         request_hash = hashlib.sha256(

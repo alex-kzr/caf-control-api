@@ -19,8 +19,7 @@ class QueueClaimTest(unittest.TestCase):
             raise ValueError("queue integration tests require a dedicated caf_queue_test_* database")
         store = PostgresStore(dsn)
         store.open()
-        with store.pool.connection() as conn:
-            actual_database = conn.execute("SELECT current_database()").fetchone()[0]
+        actual_database = store.database_name()
         if actual_database != expected_database:
             store.close()
             raise ValueError("connected database does not match dedicated queue test database")
