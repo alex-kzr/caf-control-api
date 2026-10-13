@@ -146,8 +146,14 @@ class PostgresStore:
                           finished_at = now(), updated_at = now(),
                           lease_owner = NULL, lease_expires_at = NULL
                    WHERE status = 'running' AND lease_expires_at <= now()
-                   RETURNING id"""
+                   RETURNING id, attempt"""
             ).fetchall()
+            for run_id, attempt in rows:
+                conn.execute(
+                    """INSERT INTO run_journal (run_id, attempt, event, terminal_status)
+                       VALUES (%s, %s, 'quarantined', 'failed')""",
+                    (run_id, attempt),
+                )
         return [row[0] for row in rows]
 
     @staticmethod
@@ -181,6 +187,12 @@ class PostgresStore:
                     (owner, lease_seconds),
                 )
                 row = cur.fetchone()
+                if row is not None:
+                    cur.execute(
+                        """INSERT INTO run_journal (run_id, attempt, event, owner)
+                           VALUES (%s, %s, 'claimed', %s)""",
+                        (row["id"], row["attempt"], owner),
+                    )
         return ClaimedRun(**row) if row else None
 
     def renew_lease(self, run_id: UUID, owner: str, lease_seconds: int = 60) -> bool:
@@ -209,4 +221,10 @@ class PostgresStore:
                      AND lease_expires_at > now() AND (NOT cancel_requested OR %s = 'cancelled')""",
                 (status, Jsonb(artifact), run_id, owner, status),
             )
+            if result.rowcount == 1:
+                conn.execute(
+                    """INSERT INTO run_journal (run_id, attempt, event, owner, terminal_status)
+                       SELECT id, attempt, 'completed', %s, %s FROM runs WHERE id = %s""",
+                    (owner, status, run_id),
+                )
             return result.rowcount == 1

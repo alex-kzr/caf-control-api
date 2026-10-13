@@ -32,3 +32,15 @@ CREATE INDEX IF NOT EXISTS runs_claim_idx ON runs (created_at)
 WHERE status = 'queued';
 
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS run_journal (
+    seq bigserial PRIMARY KEY,
+    run_id uuid NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    attempt integer NOT NULL,
+    event text NOT NULL CHECK (event IN ('claimed', 'completed', 'quarantined')),
+    owner text,
+    terminal_status text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS run_journal_run_idx ON run_journal (run_id, seq);

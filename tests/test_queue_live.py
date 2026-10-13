@@ -59,6 +59,15 @@ class QueueClaimTest(unittest.TestCase):
             self.assertEqual(recorded.status, "succeeded")
             self.assertEqual(recorded.attempt, 1)
             self.assertEqual(recorded.artifact, {"mode": "synthetic-test"})
+            with store.pool.connection() as conn:
+                journal = conn.execute(
+                    "SELECT event, attempt, owner, terminal_status FROM run_journal "
+                    "WHERE run_id = %s ORDER BY seq", (run.run_id,),
+                ).fetchall()
+            self.assertEqual(journal, [
+                ("claimed", 1, owner, None),
+                ("completed", 1, owner, "succeeded"),
+            ])
         finally:
             if run is not None:
                 with store.pool.connection() as conn, conn.transaction():
@@ -128,6 +137,12 @@ class QueueClaimTest(unittest.TestCase):
             assert store.quarantine_expired() == []
             assert store.get_run(expired.run_id).artifact["reason"] == "orphan_unverified"
             assert store.claim_queued(owner) is None
+            with store.pool.connection() as conn:
+                journal = conn.execute(
+                    "SELECT event, attempt FROM run_journal WHERE run_id = %s ORDER BY seq",
+                    (expired.run_id,),
+                ).fetchall()
+            assert journal == [("claimed", 1), ("quarantined", 1)]
         finally:
             for run in runs:
                 with store.pool.connection() as conn, conn.transaction():
