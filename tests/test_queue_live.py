@@ -1,6 +1,8 @@
 """Opt-in PostgreSQL claim test; it never invokes an agent runtime."""
 
 import os
+import subprocess
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
@@ -145,6 +147,64 @@ class QueueClaimTest(unittest.TestCase):
             assert journal == [("claimed", 1), ("quarantined", 1)]
         finally:
             for run in runs:
+                with store.pool.connection() as conn, conn.transaction():
+                    conn.execute("DELETE FROM runs WHERE id = %s", (run.run_id,))
+                    conn.execute("DELETE FROM tasks WHERE id = %s", (run.task_id,))
+            store.close()
+
+    def test_worker_process_exit_preserves_lease_and_quarantines_without_replay(self):
+        store = self.store()
+        run = None
+        try:
+            task = CreateTask(
+                target_repository="caf-sample-app", base_revision="a" * 40,
+                prompt="Controlled worker exit; no coding CLI",
+                acceptance_criteria=["No replay after unknown execution"], provider="codex",
+            )
+            run = store.submit(task, f"crash-test-{uuid4().hex}")
+            owner = f"worker-{uuid4().hex}"
+            fixture = (
+                "import os;from caf_control_api.storage import PostgresStore;"
+                "s=PostgresStore(os.environ['CAF_QUEUE_TEST_DATABASE_URL']);s.open();"
+                "assert s.database_name().startswith('caf_queue_test_');"
+                "assert s.claim_queued(os.environ['CAF_CRASH_TEST_OWNER']) is not None;"
+                "os._exit(23)"
+            )
+            exited = subprocess.run(
+                [sys.executable, "-c", fixture],
+                env={**os.environ, "CAF_CRASH_TEST_OWNER": owner},
+                capture_output=True, timeout=10,
+            )
+            self.assertEqual(exited.returncode, 23)
+            with store.pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT status, attempt, lease_owner, lease_expires_at FROM runs WHERE id = %s",
+                    (run.run_id,),
+                ).fetchone()
+                journal = conn.execute(
+                    "SELECT event FROM run_journal WHERE run_id = %s ORDER BY seq",
+                    (run.run_id,),
+                ).fetchall()
+            self.assertEqual(row[0:3], ("running", 1, owner))
+            self.assertIsNotNone(row[3])
+            self.assertEqual(journal, [("claimed",)])
+            self.assertIsNone(store.claim_queued(f"worker-{uuid4().hex}"))
+            with store.pool.connection() as conn, conn.transaction():
+                conn.execute(
+                    "UPDATE runs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+                    (run.run_id,),
+                )
+            self.assertEqual(store.quarantine_expired(), [run.run_id])
+            self.assertIsNone(store.claim_queued(f"worker-{uuid4().hex}"))
+            self.assertEqual(store.get_run(run.run_id).artifact["reason"], "orphan_unverified")
+            with store.pool.connection() as conn:
+                journal = conn.execute(
+                    "SELECT event FROM run_journal WHERE run_id = %s ORDER BY seq",
+                    (run.run_id,),
+                ).fetchall()
+            self.assertEqual(journal, [("claimed",), ("quarantined",)])
+        finally:
+            if run is not None:
                 with store.pool.connection() as conn, conn.transaction():
                     conn.execute("DELETE FROM runs WHERE id = %s", (run.run_id,))
                     conn.execute("DELETE FROM tasks WHERE id = %s", (run.task_id,))
