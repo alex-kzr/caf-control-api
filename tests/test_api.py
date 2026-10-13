@@ -24,6 +24,7 @@ class FakeStore:
     def __init__(self):
         self.available = True
         self.submissions = {}
+        self.cancelled = set()
 
     def ready(self):
         return self.available
@@ -45,10 +46,18 @@ class FakeStore:
                 now = datetime.now(timezone.utc)
                 return RunStatus(id=run_id, task_id=run.task_id,
                                  correlation_id=run.correlation_id, provider="codex",
-                                 max_corrections=1, status="queued", attempt=0,
+                                 max_corrections=1,
+                                 status="cancelled" if run_id in self.cancelled else "queued",
+                                 cancel_requested=run_id in self.cancelled, attempt=0,
                                  created_at=now, started_at=None, finished_at=None,
                                  updated_at=now, artifact=None)
         return None
+
+    def request_cancel(self, run_id):
+        status = self.get_run(run_id)
+        if status is not None:
+            self.cancelled.add(run_id)
+        return self.get_run(run_id)
 
 
 def client():
@@ -112,3 +121,15 @@ def test_database_pool_timeout_is_service_unavailable():
     response = http.post("/v1/tasks", json=BODY, headers=AUTH)
     assert response.status_code == 503
     assert "local diagnostic" not in response.text
+
+
+def test_cancel_requires_auth_and_is_idempotent():
+    http, _ = client()
+    run_id = http.post("/v1/tasks", json=BODY, headers=AUTH).json()["run_id"]
+    assert http.post(f"/v1/runs/{run_id}/cancel").status_code == 401
+    assert http.post(f"/v1/runs/{uuid4()}/cancel", headers=AUTH).status_code == 404
+    first = http.post(f"/v1/runs/{run_id}/cancel", headers=AUTH)
+    second = http.post(f"/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["status"] == second.json()["status"] == "cancelled"
+    assert first.json()["cancel_requested"] is True

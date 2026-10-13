@@ -96,6 +96,45 @@ class QueueClaimTest(unittest.TestCase):
                     conn.execute("DELETE FROM tasks WHERE id = %s", (run.task_id,))
             store.close()
 
+    def test_cancel_queued_and_running_and_quarantine_expired(self):
+        store = self.store()
+        runs = []
+        try:
+            for label in ("queued", "running", "expired"):
+                task = CreateTask(
+                    target_repository="caf-sample-app", base_revision="a" * 40,
+                    prompt=f"Queue control test {label}; no agent",
+                    acceptance_criteria=["State is guarded"], provider="codex",
+                )
+                runs.append(store.submit(task, f"queue-control-{uuid4().hex}"))
+            queued, running, expired = runs
+            assert store.request_cancel(queued.run_id).status == "cancelled"
+            assert store.request_cancel(queued.run_id).status == "cancelled"
+            owner = f"worker-{uuid4().hex}"
+            assert store.claim_queued(owner).id == running.run_id
+            assert store.claim_control(running.run_id, owner) == (True, False)
+            assert store.request_cancel(running.run_id).cancel_requested is True
+            assert store.claim_control(running.run_id, owner) == (True, True)
+            assert store.renew_lease(running.run_id, owner)
+            assert not store.complete_claim(running.run_id, owner, "succeeded", {})
+            assert store.complete_claim(running.run_id, owner, "cancelled", {"reason": "requested"})
+            assert store.claim_queued(owner).id == expired.run_id
+            with store.pool.connection() as conn, conn.transaction():
+                conn.execute(
+                    "UPDATE runs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+                    (expired.run_id,),
+                )
+            assert store.quarantine_expired() == [expired.run_id]
+            assert store.quarantine_expired() == []
+            assert store.get_run(expired.run_id).artifact["reason"] == "orphan_unverified"
+            assert store.claim_queued(owner) is None
+        finally:
+            for run in runs:
+                with store.pool.connection() as conn, conn.transaction():
+                    conn.execute("DELETE FROM runs WHERE id = %s", (run.run_id,))
+                    conn.execute("DELETE FROM tasks WHERE id = %s", (run.task_id,))
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,4 +88,12 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
             raise HTTPException(status_code=404, detail="Run not found")
         return result
 
+    @app.post("/v1/runs/{run_id}/cancel", response_model=RunStatus,
+              dependencies=[Depends(authorized)])
+    def cancel_run(run_id: UUID):
+        result = store.request_cancel(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return result
+
     return app

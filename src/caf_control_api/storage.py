@@ -36,6 +36,7 @@ class Store(Protocol):
     def ready(self) -> bool: ...
     def submit(self, task: CreateTask, key: str | None) -> SubmittedRun: ...
     def get_run(self, run_id: UUID) -> RunStatus | None: ...
+    def request_cancel(self, run_id: UUID) -> RunStatus | None: ...
 
 
 class PostgresStore:
@@ -103,13 +104,51 @@ class PostgresStore:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """SELECT id, task_id, correlation_id, provider, max_corrections,
-                              status, attempt, created_at, started_at, finished_at,
+                              status, attempt, cancel_requested, created_at, started_at, finished_at,
                               updated_at, artifact
                        FROM runs WHERE id = %s""",
                     (run_id,),
                 )
                 row = cur.fetchone()
         return RunStatus(**row) if row else None
+
+    def request_cancel(self, run_id: UUID) -> RunStatus | None:
+        """Cancel queued work immediately, or signal its current worker."""
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute(
+                """UPDATE runs SET cancel_requested = true,
+                          status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+                          finished_at = CASE WHEN status = 'queued' THEN now() ELSE finished_at END,
+                          updated_at = now()
+                   WHERE id = %s AND status IN ('queued', 'running')""",
+                (run_id,),
+            )
+        return self.get_run(run_id)
+
+    def claim_control(self, run_id: UUID, owner: str) -> tuple[bool, bool]:
+        """Return ownership and cancellation signal for a live lease."""
+        self._lease_args(owner, 60)
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT lease_expires_at > now(), cancel_requested FROM runs
+                   WHERE id = %s AND status = 'running' AND lease_owner = %s""",
+                (run_id, owner),
+            ).fetchone()
+        return (bool(row[0]), bool(row[1])) if row else (False, False)
+
+    def quarantine_expired(self) -> list[UUID]:
+        """Stop redispatch of expired work; an orphan CLI may still exist."""
+        with self.pool.connection() as conn, conn.transaction():
+            rows = conn.execute(
+                """UPDATE runs SET status = 'failed',
+                          artifact = jsonb_build_object('reason', 'orphan_unverified',
+                                                        'attempt', attempt),
+                          finished_at = now(), updated_at = now(),
+                          lease_owner = NULL, lease_expires_at = NULL
+                   WHERE status = 'running' AND lease_expires_at <= now()
+                   RETURNING id"""
+            ).fetchall()
+        return [row[0] for row in rows]
 
     @staticmethod
     def _lease_args(owner: str, lease_seconds: int) -> None:
@@ -125,7 +164,7 @@ class PostgresStore:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """WITH candidate AS (
-                           SELECT id FROM runs WHERE status = 'queued'
+                           SELECT id FROM runs WHERE status = 'queued' AND NOT cancel_requested
                            ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1
                        )
                        UPDATE runs AS r
@@ -167,7 +206,7 @@ class PostgresStore:
                           finished_at = now(), updated_at = now(),
                           lease_owner = NULL, lease_expires_at = NULL
                    WHERE id = %s AND status = 'running' AND lease_owner = %s
-                     AND lease_expires_at > now()""",
-                (status, Jsonb(artifact), run_id, owner),
+                     AND lease_expires_at > now() AND (NOT cancel_requested OR %s = 'cancelled')""",
+                (status, Jsonb(artifact), run_id, owner, status),
             )
             return result.rowcount == 1

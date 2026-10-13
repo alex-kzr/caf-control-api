@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS runs (
     lease_owner text,
     lease_expires_at timestamptz,
     attempt integer NOT NULL DEFAULT 0,
+    cancel_requested boolean NOT NULL DEFAULT false,
     artifact jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     started_at timestamptz,
@@ -29,3 +30,5 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS runs_claim_idx ON runs (created_at)
 WHERE status = 'queued';
+
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;

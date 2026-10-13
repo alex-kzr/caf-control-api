@@ -38,6 +38,7 @@ class RunStatus(BaseModel):
     max_corrections: int
     status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
     attempt: int
+    cancel_requested: bool = False
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
