@@ -70,6 +70,8 @@ def test_intake_requires_auth_and_validates_target():
     http, _ = client()
     assert http.post("/v1/tasks", json=BODY).status_code == 401
     assert http.post("/v1/tasks", json=BODY, headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert http.post("/v1/tasks", json=BODY,
+                     headers={b"Authorization": b"Bearer caf\xe9"}).status_code == 401
     invalid = {**BODY, "target_repository": "../../host"}
     assert http.post("/v1/tasks", json=invalid, headers=AUTH).status_code == 422
     invalid = {**BODY, "base_revision": "main"}

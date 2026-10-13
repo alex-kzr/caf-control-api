@@ -47,7 +47,9 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
 
     def authorized(authorization: str | None = Header(default=None)) -> None:
         scheme, _, credential = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not compare_digest(credential, settings.api_token):
+        if scheme.lower() != "bearer" or not compare_digest(
+            credential.encode("utf-8"), settings.api_token.encode("utf-8")
+        ):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     @app.exception_handler(psycopg.Error)
