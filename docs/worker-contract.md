@@ -1,6 +1,15 @@
 # P0 worker handoff
 
-The API persists `tasks` and `runs` atomically in PostgreSQL. `runs.status='queued'` is the durable wake-up signal; Redis is not required for this first slice. The worker may poll PostgreSQL at a bounded interval. No process is started by the API. The queue operations described below are implemented in `PostgresStore`; no worker daemon or automatic task execution is active yet.
+The API persists `tasks` and `runs` atomically in PostgreSQL. `runs.status='queued'` is the durable wake-up signal; Redis is not required for this first slice. The worker may poll PostgreSQL at a bounded interval. No process is started by the API. The queue operations described below are implemented in `PostgresStore`; a test-only synthetic daemon exists in the separate worker project, but automatic real CLI execution is not active.
+
+The direct `claim_queued` method below remains a broad, local test primitive.
+The HTTP worker route instead calls `claim_scoped` with a complete, expiring
+`WorkerGrant`. Its SQL matches one exact Run and Task, repository, workspace
+ID, base revision and provider before changing the Run. `workspace_id` is an
+optional intake field for older clients, but a null value cannot match a
+scoped grant. The grant also binds worker owner identity and exact connected
+`caf_queue_test_*` database. `quarantine_expired_scoped` is similarly limited
+to that Run and owner. Core does not configure a worker grant.
 
 `claim_queued` claims one non-cancelled `queued` run in a transaction using `FOR UPDATE SKIP LOCKED`, preferring oldest `created_at`. It sets `status='running'`, a caller-supplied unique `lease_owner`, `lease_expires_at`, `started_at=COALESCE(started_at, now())`, `updated_at=now()`, and increments `attempt`. It returns the joined Task fields. `renew_lease` requires the matching owner, `running` status and an unexpired lease. `claim_control` reports whether the lease is still owned and whether cancellation was requested. `request_cancel` immediately terminates queued work or flags running work; it is idempotent for terminal work. `complete_claim` rejects success/failure after a cancellation request but permits an owner-guarded `cancelled` ACK. Expired `running` rows are **not** reclaimed: doing so safely requires orphan CLI reconciliation first. `quarantine_expired` instead marks them `failed/orphan_unverified`; it does not prove a child process stopped. No automatic retry occurs. A transient database outage must not lead to unbounded duplicate execution.
 
