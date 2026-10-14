@@ -34,8 +34,9 @@ Example body:
 
 ## Verification and limits
 
-The new results/events endpoints have authenticated test-store coverage;
-their SQL-backed HTTP path has not yet been live verified.
+The results/events endpoints have authenticated test-store coverage and one
+isolated SQL-backed HTTP check on 2026-10-14; see the umbrella
+[evidence](../../docs/experiments/2026-10-14-p0-live-run-and-crash.md).
 
 `uv run --locked --python 3.12 --extra test pytest -q` covers authentication, request validation, idempotent responses, cancellation, status retrieval and readiness behavior with a test store. The opt-in `tests/test_queue_live.py` runs only against a dedicated `caf_queue_test_*` database and verifies concurrent claim, lease, cancellation, expired-Run quarantine and the transactionally written `run_journal`. The journal records claim, terminal completion and quarantine with attempt and owner; the Run row holds the durable lease. It is a small lifecycle journal, not the full event/checkpoint/audit model in SPEC. The umbrella's API/PostgreSQL Compose slice has also passed live readiness, authenticated intake and normal group stop/start. These checks do **not** prove a production worker process, CLI process-tree cleanup, resume or complete SPEC core. Other SPEC entities, streaming, checkpoint recovery, and schema migration versioning remain future work.
 
